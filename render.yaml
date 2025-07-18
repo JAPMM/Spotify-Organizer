@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: spotify-liked-songs-archiver
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    schedule:
+      - cron: "0 0 1 * *"
+        name: monthly-run
