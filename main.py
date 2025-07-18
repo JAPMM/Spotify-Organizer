@@ -1,102 +1,105 @@
 import os
 import json
+from datetime import datetime, timedelta
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
-ARCHIVE_FILE = "archive_tracker.json"
-TRACKS_PER_BATCH = 50
-DESC = "Auto-created from liked songs archive"
-
-def load_tracker():
-    if os.path.exists(ARCHIVE_FILE):
-        with open(ARCHIVE_FILE) as f:
-            return json.load(f)
-    return {
-        "archived_ids": [],
-        "carryover_ids": [],
-        "batch_number": 1
-    }
-
-def save_tracker(data):
-    with open(ARCHIVE_FILE, "w") as f:
-        json.dump(data, f)
+DESC = "Auto-created by Liked Songs Manager"
+GENRE_PLAYLIST_NAME = "All Liked Songs by Genre"
+RECENT_50_NAME = "Recent 50 Liked Songs"
 
 def get_spotify():
     return spotipy.Spotify(auth_manager=SpotifyOAuth(
         client_id=os.getenv("SPOTIPY_CLIENT_ID"),
         client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
         redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
-        scope="user-library-read playlist-modify-private"
+        scope="user-library-read playlist-modify-private user-library-read"
     ))
 
-def get_liked(sp):
+def get_liked_songs(sp, limit=5000):
     liked = []
     offset = 0
     while True:
         results = sp.current_user_saved_tracks(limit=50, offset=offset)
-        items = results["items"]
+        items = results['items']
         if not items:
             break
         liked.extend(items)
         offset += 50
-    return [t["track"]["id"] for t in liked if t["track"] and t["track"]["id"]]
+        if len(liked) >= limit:
+            break
+    return liked
 
-def create_playlist(sp, user_id, name, track_ids):
-    playlist = sp.user_playlist_create(user=user_id, name=name, public=False, description=DESC)
-    sp.playlist_add_items(playlist["id"], track_ids)
+def create_or_replace_playlist(sp, user_id, name, track_ids):
+    existing = sp.current_user_playlists(limit=50)["items"]
+    playlist = next((pl for pl in existing if pl["name"] == name), None)
+
+    if playlist:
+        sp.playlist_replace_items(playlist_id=playlist["id"], items=track_ids)
+        print(f"🔁 Updated: {name}")
+    else:
+        playlist = sp.user_playlist_create(user=user_id, name=name, public=False, description=DESC)
+        sp.playlist_add_items(playlist["id"], items=track_ids)
+        print(f"✅ Created: {name}")
+
+def make_monthly_playlist(sp, user_id, liked):
+    # Determine last full calendar month
+    today = datetime.utcnow()
+    first_of_this_month = today.replace(day=1)
+    last_month_end = first_of_this_month - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+
+    # Filter liked songs from last month
+    monthly_tracks = [
+        item['track']['id']
+        for item in liked
+        if last_month_start <= datetime.strptime(item['added_at'], "%Y-%m-%dT%H:%M:%SZ") <= last_month_end
+    ]
+
+    if monthly_tracks:
+        label = last_month_end.strftime("%B %Y")
+        name = f"Liked Songs - {label}"
+        create_or_replace_playlist(sp, user_id, name, list(reversed(monthly_tracks)))  # oldest to newest
+    else:
+        print("📭 No songs liked last month. Skipping monthly playlist.")
+
+def make_recent_50_playlist(sp, user_id, liked):
+    recent_50 = [item['track']['id'] for item in liked[:50] if item['track']]
+    create_or_replace_playlist(sp, user_id, RECENT_50_NAME, recent_50)
+
+def make_genre_playlist(sp, user_id, liked):
+    genre_map = {}
+    all_track_ids = []
+
+    for item in liked:
+        track = item['track']
+        if not track:
+            continue
+        track_id = track['id']
+        all_track_ids.append(track_id)
+
+        # Get artist genres
+        artist_id = track['artists'][0]['id']
+        artist = sp.artist(artist_id)
+        genres = artist.get("genres", [])
+
+        primary_genre = genres[0] if genres else "Unknown"
+        genre_map.setdefault(primary_genre, []).append(track_id)
+
+    # Flatten genre blocks in alphabetical order
+    sorted_genres = sorted(genre_map.items())
+    flattened = [tid for genre, tracks in sorted_genres for tid in tracks]
+
+    create_or_replace_playlist(sp, user_id, GENRE_PLAYLIST_NAME, flattened)
 
 def run():
     sp = get_spotify()
     user_id = sp.me()["id"]
-    tracker = load_tracker()
+    liked = get_liked_songs(sp)
 
-    archived_ids = set(tracker["archived_ids"])
-    carryover = tracker["carryover_ids"]
-    batch_num = tracker["batch_number"]
-
-    liked = get_liked(sp)
-
-    # Deduplicate and preserve order
-    seen = set()
-    unique = []
-    for tid in liked:
-        if tid not in seen:
-            seen.add(tid)
-            unique.append(tid)
-
-    # Get newest 50 liked tracks (always)
-    start = (batch_num - 1) * TRACKS_PER_BATCH
-    end = batch_num * TRACKS_PER_BATCH
-    all_batch = unique[start:end]
-
-    if len(all_batch) < TRACKS_PER_BATCH:
-        print("❌ Not enough liked songs to generate next batch.")
-        return
-
-    # === Create 'All' Playlist ===
-    name_all = f"Liked Songs #{batch_num} (All)"
-    create_playlist(sp, user_id, name_all, all_batch)
-    print(f"✅ Created: {name_all}")
-
-    # === Create 'Fresh' Playlist ===
-    fresh_candidates = carryover + [tid for tid in all_batch if tid not in archived_ids and tid not in carryover]
-
-    if len(fresh_candidates) >= TRACKS_PER_BATCH:
-        fresh_batch = fresh_candidates[:TRACKS_PER_BATCH]
-        name_fresh = f"Liked Songs #{batch_num} (Fresh)"
-        create_playlist(sp, user_id, name_fresh, fresh_batch)
-        print(f"✅ Created: {name_fresh}")
-        archived_ids.update(fresh_batch)
-        carryover = fresh_candidates[TRACKS_PER_BATCH:]  # leftovers
-    else:
-        print(f"⏭️ Only {len(fresh_candidates)} fresh tracks. Skipping Fresh playlist this time.")
-        carryover = fresh_candidates  # keep for next run
-
-    # Save updates
-    tracker["archived_ids"] = list(archived_ids)
-    tracker["carryover_ids"] = carryover
-    tracker["batch_number"] = batch_num + 1
-    save_tracker(tracker)
+    make_monthly_playlist(sp, user_id, liked)
+    make_recent_50_playlist(sp, user_id, liked)
+    make_genre_playlist(sp, user_id, liked)
 
 if __name__ == "__main__":
     run()
